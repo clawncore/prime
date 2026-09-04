@@ -1,3 +1,4 @@
+import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:flutter/services.dart';
@@ -6,10 +7,21 @@ import 'theme/prime_theme.dart';
 import 'services/state_service.dart';
 import 'services/audio_service.dart';
 import 'services/voice_service.dart';
+import 'services/debug_service.dart';
 import 'screens/splash_screen.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // Capture all Flutter errors into DebugService
+  FlutterError.onError = (details) {
+    DebugService.instance.error('FLUTTER', '${details.exceptionAsString()}\n${details.stack ?? ''}');
+    FlutterError.presentError(details);
+  };
+  PlatformDispatcher.instance.onError = (error, stack) {
+    DebugService.instance.error('DART', '$error\n$stack');
+    return true;
+  };
 
   await WindowManager.instance.ensureInitialized();
 
@@ -17,7 +29,7 @@ void main() async {
     size: Size(1400, 900),
     minimumSize: Size(1024, 640),
     center: true,
-    title: 'CLAWN PRIME',
+    title: 'PRIME',
     titleBarStyle: TitleBarStyle.hidden,
     windowButtonVisibility: true,
   );
@@ -48,7 +60,7 @@ class PrimeApp extends StatelessWidget {
     return ChangeNotifierProvider(
       create: (_) => StateService()..initialize(),
       child: MaterialApp(
-        title: 'CLAWN PRIME',
+        title: 'PRIME',
         debugShowCheckedModeBanner: false,
         theme: PrimeTheme.darkTheme,
         themeMode: ThemeMode.dark,

@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
+import '../voice/tts_provider.dart';
+import '../voice/sapi_tts_provider.dart';
 import 'audio_service.dart';
 
 enum VoiceState {
@@ -45,10 +47,17 @@ class VoiceService {
     if (_initialized) return;
 
     try {
-      debugPrint('[VoiceService] Initializing Windows SAPI voice system...');
+      debugPrint('[VoiceService] Initializing voice system...');
+
+      if (!Platform.isWindows) {
+        debugPrint('[VoiceService] Voice services require Windows (SAPI). Skipping on ${Platform.operatingSystem}.');
+        _ttsAvailable = false;
+        _initialized = true;
+        return;
+      }
 
       final tempDir = await getTemporaryDirectory();
-      _scriptDir = '${tempDir.path}\\prime_voice';
+      _scriptDir = '${tempDir.path}${Platform.pathSeparator}prime_voice';
       await Directory(_scriptDir!).create(recursive: true);
 
       _ttsAvailable = await _testSapi();
@@ -71,7 +80,7 @@ Add-Type -AssemblyName System.Speech
 Write-Output \$voices.Count
 \$synth.Dispose()
 ''';
-      final scriptPath = '$_scriptDir\\test.ps1';
+      final scriptPath = '${_scriptDir}${Platform.pathSeparator}test.ps1';
       await File(scriptPath).writeAsString(script);
 
       final result = await Process.run('powershell.exe', [
@@ -116,7 +125,7 @@ Add-Type -AssemblyName System.Speech
 \$synth.Speak('$escapedText')
 \$synth.Dispose()
 ''';
-      final scriptPath = '$_scriptDir\\speak.ps1';
+      final scriptPath = '${_scriptDir}${Platform.pathSeparator}speak.ps1';
       await File(scriptPath).writeAsString(script);
 
       // Run PowerShell
@@ -166,6 +175,12 @@ Add-Type -AssemblyName System.Speech
       await stopSpeaking();
       _updateState(VoiceState.listening);
 
+      if (!Platform.isWindows) {
+        debugPrint('[VoiceService] Speech recognition requires Windows (SAPI). Skipping on ${Platform.operatingSystem}.');
+        _updateState(VoiceState.idle);
+        return;
+      }
+
       try {
         // Write PowerShell script for speech recognition
         final script = '''
@@ -182,7 +197,7 @@ if (\$result -ne \$null) {
 }
 ''';
 
-        final scriptPath = '$_scriptDir\\listen.ps1';
+        final scriptPath = '${_scriptDir}${Platform.pathSeparator}listen.ps1';
         await File(scriptPath).writeAsString(script);
 
         final result = await Process.run('powershell.exe', [
@@ -217,7 +232,6 @@ if (\$result -ne \$null) {
     }
   }
 
-  @override
   void dispose() {
     stopSpeaking();
     _stateController.close();

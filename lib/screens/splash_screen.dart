@@ -1,9 +1,9 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
-import 'package:provider/provider.dart';
 import '../theme/prime_theme.dart';
-import '../services/state_service.dart';
 import '../services/audio_service.dart';
+import '../services/state_service.dart';
+import '../services/voice_service.dart';
 import 'command_center.dart';
 
 class SplashScreen extends StatefulWidget {
@@ -13,310 +13,277 @@ class SplashScreen extends StatefulWidget {
   State<SplashScreen> createState() => _SplashScreenState();
 }
 
-class _SplashScreenState extends State<SplashScreen>
-    with SingleTickerProviderStateMixin {
-  late AnimationController _controller;
-  late Animation<double> _fadeIn;
-  late Animation<double> _scaleUp;
+class _SplashScreenState extends State<SplashScreen> with TickerProviderStateMixin {
+  late AnimationController _logoController;
+  late AnimationController _progressController;
+  late Animation<double> _logoOpacity;
+  late Animation<double> _logoScale;
 
-  int _step = 0;
-  final List<String> _steps = [
+  int _currentStep = 0;
+  bool _booting = true;
+
+  final _steps = const [
     'INITIALIZING PRIME...',
     'LOADING CORE MODULES...',
-    'CONNECTING NEURAL MESH...',
-    'CALIBRATING SENSORS...',
+    'CHECKING LLM STATUS...',
+    'LOADING CONFIGURATION...',
     'CHECKING AGENT STATUS...',
     'CORE ONLINE',
   ];
-  Timer? _stepTimer;
 
   @override
   void initState() {
     super.initState();
-    _controller = AnimationController(
+
+    _logoController = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 600),
+      duration: const Duration(milliseconds: 800),
     );
-    _fadeIn = CurvedAnimation(parent: _controller, curve: Curves.easeOut);
-    _scaleUp = Tween<double>(begin: 0.8, end: 1.0).animate(
-      CurvedAnimation(parent: _controller, curve: Curves.easeOutBack),
-    );
-    _controller.forward();
 
-    _advanceSteps();
+    _logoOpacity = Tween<double>(begin: 0, end: 1).animate(
+      CurvedAnimation(parent: _logoController, curve: Curves.easeOut),
+    );
+    _logoScale = Tween<double>(begin: 0.8, end: 1.0).animate(
+      CurvedAnimation(parent: _logoController, curve: Curves.easeOut),
+    );
+
+    _progressController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1500),
+    );
+
+    _logoController.forward();
+    _startBoot();
   }
 
-  void _advanceSteps() {
-    _stepTimer = Timer.periodic(const Duration(milliseconds: 700), (timer) {
-      if (_step < _steps.length - 1) {
-        setState(() => _step++);
-        AudioService.instance.playNotification();
-      } else {
-        timer.cancel();
-        _completeBoot();
-      }
-    });
-  }
+  Future<void> _startBoot() async {
+    for (int i = 0; i < _steps.length; i++) {
+      await Future.delayed(const Duration(milliseconds: 150));
+      if (!mounted) return;
+      setState(() => _currentStep = i);
+      AudioService.instance.playNotification();
+    }
 
-  void _completeBoot() async {
-    await Future.delayed(const Duration(milliseconds: 500));
+    _progressController.forward();
+
+    await Future.delayed(const Duration(milliseconds: 200));
+    AudioService.instance.playStartup();
+
+    await Future.delayed(const Duration(milliseconds: 300));
     if (!mounted) return;
 
-    AudioService.instance.playStartup();
-    context.read<StateService>().initialize();
-
-    await Future.delayed(const Duration(milliseconds: 1200));
+    await Future.delayed(const Duration(milliseconds: 200));
     if (!mounted) return;
 
     Navigator.of(context).pushReplacement(
       PageRouteBuilder(
-        pageBuilder: (context, animation, secondaryAnimation) =>
-            const CommandCenter(),
-        transitionsBuilder: (context, animation, secondaryAnimation, child) {
-          return FadeTransition(
-            opacity: CurvedAnimation(
-              parent: animation,
-              curve: Curves.easeInOut,
-            ),
-            child: child,
-          );
+        pageBuilder: (_, __, ___) => const CommandCenter(),
+        transitionsBuilder: (_, anim, __, child) {
+          return FadeTransition(opacity: anim, child: child);
         },
-        transitionDuration: const Duration(milliseconds: 800),
+        transitionDuration: const Duration(milliseconds: 400),
       ),
     );
   }
 
   @override
   void dispose() {
-    _stepTimer?.cancel();
-    _controller.dispose();
+    _logoController.dispose();
+    _progressController.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: PrimeTheme.surface950,
-      body: Center(
-        child: AnimatedBuilder(
-          animation: _controller,
-          builder: (context, child) {
-            return FadeTransition(
-              opacity: _fadeIn,
-              child: ScaleTransition(
-                scale: _scaleUp,
-                child: _buildContent(),
+      backgroundColor: PrimeTheme.bgDeep,
+      body: Container(
+        decoration: const BoxDecoration(gradient: PrimeTheme.bgGradient),
+        child: Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              // Logo
+              AnimatedBuilder(
+                animation: _logoController,
+                builder: (context, child) {
+                  return Opacity(
+                    opacity: _logoOpacity.value,
+                    child: Transform.scale(
+                      scale: _logoScale.value,
+                      child: _buildLogo(),
+                    ),
+                  );
+                },
               ),
-            );
-          },
+
+              const SizedBox(height: 32),
+
+              // Title
+              Text(
+                'PRIME',
+                style: TextStyle(
+                  fontFamily: 'JetBrains Mono',
+                  fontSize: 28,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 6.0,
+                  color: PrimeTheme.primeCyan,
+                ),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                'PERSONAL AI SYSTEM',
+                style: TextStyle(
+                  fontFamily: 'JetBrains Mono',
+                  fontSize: 10,
+                  fontWeight: FontWeight.w400,
+                  letterSpacing: 2.0,
+                  color: PrimeTheme.textMuted,
+                ),
+              ),
+
+              const SizedBox(height: 48),
+
+              // Boot steps
+              ...List.generate(_steps.length, (i) {
+                return _buildStep(i);
+              }),
+
+              const SizedBox(height: 40),
+
+              // Progress bar
+              SizedBox(
+                width: 200,
+                child: Column(
+                  children: [
+                    AnimatedBuilder(
+                      animation: _progressController,
+                      builder: (context, child) {
+                        return LinearProgressIndicator(
+                          value: _progressController.value,
+                          backgroundColor: PrimeTheme.borderSubtle,
+                          valueColor: const AlwaysStoppedAnimation<Color>(PrimeTheme.primeCyan),
+                        );
+                      },
+                    ),
+                    const SizedBox(height: 6),
+                    AnimatedBuilder(
+                      animation: _progressController,
+                      builder: (context, child) {
+                        return Text(
+                          '${(_progressController.value * 100).round()}%',
+                          style: TextStyle(
+                            fontFamily: 'JetBrains Mono',
+                            fontSize: 9,
+                            color: PrimeTheme.textDim,
+                          ),
+                        );
+                      },
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );
   }
 
-  Widget _buildContent() {
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        // PRIME Logo
-        Container(
-          width: 80,
-          height: 80,
-          decoration: BoxDecoration(
-            shape: BoxShape.circle,
-            border: Border.all(
-              color: PrimeTheme.primeCyan.withValues(alpha: 0.3),
-              width: 2,
-            ),
-            boxShadow: [
-              BoxShadow(
-                color: PrimeTheme.primeCyan.withValues(alpha: 0.2),
-                blurRadius: 30,
-                spreadRadius: 5,
-              ),
-            ],
+  Widget _buildLogo() {
+    return Container(
+      width: 80,
+      height: 80,
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        border: Border.all(color: PrimeTheme.primeCyan.withValues(alpha: 0.5), width: 2),
+        boxShadow: [
+          BoxShadow(
+            color: PrimeTheme.primeCyan.withValues(alpha: 0.15),
+            blurRadius: 30,
+            spreadRadius: 5,
           ),
-          child: Center(
-            child: Text(
-              '◈',
-              style: TextStyle(
-                color: PrimeTheme.primeCyan,
-                fontSize: 36,
-                fontWeight: FontWeight.w700,
-                shadows: [
-                  Shadow(
-                    color: PrimeTheme.primeCyan.withValues(alpha: 0.5),
-                    blurRadius: 10,
-                  ),
-                ],
-              ),
-            ),
-          ),
-        ),
-        const SizedBox(height: 24),
-        const Text(
-          'CLAWN PRIME',
+        ],
+      ),
+      child: Center(
+        child: Text(
+          'P',
           style: TextStyle(
-            color: PrimeTheme.primeCyan,
-            fontSize: 28,
+            fontFamily: 'JetBrains Mono',
+            fontSize: 32,
             fontWeight: FontWeight.w700,
-            letterSpacing: 8,
-            fontFamily: 'JetBrains Mono',
-            shadows: [
-              Shadow(
-                color: PrimeTheme.primeCyan,
-                blurRadius: 20,
-              ),
-            ],
+            color: PrimeTheme.primeCyan,
           ),
         ),
-        const SizedBox(height: 8),
-        const Text(
-          'AUTONOMOUS AI COMMAND CENTER',
-          style: TextStyle(
-            color: PrimeTheme.textMuted,
-            fontSize: 10,
-            fontWeight: FontWeight.w500,
-            letterSpacing: 4,
-            fontFamily: 'JetBrains Mono',
-          ),
-        ),
-        const SizedBox(height: 40),
-        // Step progress
-        SizedBox(
-          width: 300,
-          child: Column(
-            children: [
-              ...List.generate(_steps.length, (index) {
-                final isActive = index == _step;
-                final isComplete = index < _step;
-                return _buildStepRow(_steps[index], isActive, isComplete);
-              }),
-            ],
-          ),
-        ),
-        const SizedBox(height: 40),
-        // Progress bar
-        SizedBox(
-          width: 200,
-          child: Column(
-            children: [
-              ClipRRect(
-                borderRadius: BorderRadius.circular(2),
-                child: LinearProgressIndicator(
-                  value: (_step + 1) / _steps.length,
-                  backgroundColor: PrimeTheme.surface700,
-                  valueColor:
-                      const AlwaysStoppedAnimation(PrimeTheme.primeCyan),
-                  minHeight: 3,
-                ),
-              ),
-              const SizedBox(height: 8),
-              Text(
-                '${(((_step + 1) / _steps.length) * 100).toInt()}%',
-                style: const TextStyle(
-                  color: PrimeTheme.textMuted,
-                  fontSize: 9,
-                  fontFamily: 'JetBrains Mono',
-                  letterSpacing: 2,
-                ),
-              ),
-            ],
-          ),
-        ),
-      ],
+      ),
     );
   }
 
-  Widget _buildStepRow(String label, bool isActive, bool isComplete) {
-    final color = isActive
-        ? PrimeTheme.primeCyan
-        : isComplete
-            ? PrimeTheme.primeGreen
-            : PrimeTheme.textMuted;
+  Widget _buildStep(int index) {
+    final isComplete = index < _currentStep;
+    final isActive = index == _currentStep;
+
+    Color dotColor;
+    Widget dot;
+
+    if (isComplete) {
+      dotColor = PrimeTheme.statusOnline;
+      dot = Icon(Icons.check_circle, size: 12, color: dotColor);
+    } else if (isActive) {
+      dotColor = PrimeTheme.primeCyan;
+      dot = Container(
+        width: 10,
+        height: 10,
+        decoration: BoxDecoration(
+          shape: BoxShape.circle,
+          border: Border.all(color: dotColor, width: 1.5),
+        ),
+        child: Center(
+          child: Container(
+            width: 4,
+            height: 4,
+            decoration: BoxDecoration(
+              color: dotColor,
+              shape: BoxShape.circle,
+            ),
+          ),
+        ),
+      );
+    } else {
+      dotColor = PrimeTheme.textDim;
+      dot = Container(
+        width: 10,
+        height: 10,
+        decoration: BoxDecoration(
+          shape: BoxShape.circle,
+          border: Border.all(color: dotColor, width: 1),
+        ),
+      );
+    }
 
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 3),
       child: Row(
+        mainAxisSize: MainAxisSize.min,
         children: [
-          SizedBox(
-            width: 14,
-            height: 14,
-            child: isComplete
-                ? Icon(Icons.check, size: 10, color: color)
-                : isActive
-                    ? _PulsingDot(color: color)
-                    : Icon(Icons.circle, size: 6, color: color),
-          ),
+          dot,
           const SizedBox(width: 10),
           Text(
-            label,
+            _steps[index],
             style: TextStyle(
-              color: color,
-              fontSize: 9,
-              fontWeight: isActive ? FontWeight.w700 : FontWeight.w400,
-              letterSpacing: 1.5,
               fontFamily: 'JetBrains Mono',
+              fontSize: 10,
+              fontWeight: isActive ? FontWeight.w600 : FontWeight.w400,
+              letterSpacing: 0.8,
+              color: isComplete
+                  ? PrimeTheme.statusOnline
+                  : isActive
+                      ? PrimeTheme.primeCyan
+                      : PrimeTheme.textDim,
             ),
           ),
         ],
       ),
-    );
-  }
-}
-
-class _PulsingDot extends StatefulWidget {
-  final Color color;
-
-  const _PulsingDot({required this.color});
-
-  @override
-  State<_PulsingDot> createState() => _PulsingDotState();
-}
-
-class _PulsingDotState extends State<_PulsingDot>
-    with SingleTickerProviderStateMixin {
-  late AnimationController _pulseController;
-
-  @override
-  void initState() {
-    super.initState();
-    _pulseController = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 800),
-    )..repeat(reverse: true);
-  }
-
-  @override
-  void dispose() {
-    _pulseController.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return AnimatedBuilder(
-      animation: _pulseController,
-      builder: (context, _) {
-        return Container(
-          width: 8,
-          height: 8,
-          decoration: BoxDecoration(
-            shape: BoxShape.circle,
-            color: widget.color.withValues(
-              alpha: 0.5 + _pulseController.value * 0.5,
-            ),
-            boxShadow: [
-              BoxShadow(
-                color: widget.color.withValues(
-                  alpha: 0.3 + _pulseController.value * 0.3,
-                ),
-                blurRadius: 6,
-              ),
-            ],
-          ),
-        );
-      },
     );
   }
 }

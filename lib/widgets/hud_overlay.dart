@@ -106,7 +106,7 @@ class _HudPainter extends CustomPainter {
           Colors.transparent,
         ],
       ).createShader(
-        Rect.fromLTWH(0, scanY, size, 60),
+        Rect.fromLTWH(0, scanY, size.width, 60),
       );
 
     canvas.drawRect(

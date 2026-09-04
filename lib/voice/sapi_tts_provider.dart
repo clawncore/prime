@@ -19,6 +19,10 @@ class SapiTTSProvider implements TTSProvider {
   String _currentVoice = 'Microsoft Zira Desktop';
   double _rate = 1.0;
   double _volume = 1.0;
+  final StreamController<double> _amplitudeController =
+      StreamController<double>.broadcast();
+
+  SapiTTSProvider();
 
   @override
   String get name => 'Windows SAPI';
@@ -26,12 +30,20 @@ class SapiTTSProvider implements TTSProvider {
   @override
   bool get isSpeaking => _isSpeaking;
 
+  @override
+  Stream<double> get amplitudeStream => _amplitudeController.stream;
+
   Future<void> initialize() async {
     if (_initialized) return;
 
+    if (!Platform.isWindows) {
+      debugPrint('[SapiTTS] Windows SAPI not available on ${Platform.operatingSystem}');
+      return;
+    }
+
     try {
       final tempDir = await getTemporaryDirectory();
-      _scriptDir = '${tempDir.path}\\prime_voice';
+      _scriptDir = '${tempDir.path}${Platform.pathSeparator}prime_voice';
       await Directory(_scriptDir!).create(recursive: true);
       _initialized = true;
       debugPrint('[SapiTTS] Initialized');
@@ -62,7 +74,7 @@ Add-Type -AssemblyName System.Speech
 \$synth.Speak('$escapedText')
 \$synth.Dispose()
 ''';
-      final scriptPath = '$_scriptDir\\speak.ps1';
+      final scriptPath = '${_scriptDir}${Platform.pathSeparator}speak.ps1';
       await File(scriptPath).writeAsString(script);
 
       // Run PowerShell
@@ -96,6 +108,19 @@ Add-Type -AssemblyName System.Speech
   }
 
   @override
+  Future<List<int>?> synthesizeToBytes(String text) async {
+    // SAPI doesn't easily support byte output via PowerShell
+    // Return null to fall back to direct speak()
+    return null;
+  }
+
+  @override
+  Future<void> playBytes(List<int> audioBytes) async {
+    // SAPI doesn't support byte playback
+    // Fall back to speak() if needed
+  }
+
+  @override
   Future<bool> isAvailable() async {
     try {
       final result = await Process.run('powershell.exe', [
@@ -120,7 +145,7 @@ foreach (\$v in \$synth.GetInstalledVoices()) {
 }
 \$synth.Dispose()
 ''';
-      final scriptPath = '$_scriptDir\\voices.ps1';
+      final scriptPath = '${_scriptDir}${Platform.pathSeparator}voices.ps1';
       await File(scriptPath).writeAsString(script);
 
       final result = await Process.run('powershell.exe', [
@@ -155,5 +180,11 @@ foreach (\$v in \$synth.GetInstalledVoices()) {
   Future<void> setVolume(double volume) async {
     _volume = volume.clamp(0.0, 1.0);
     debugPrint('[SapiTTS] Volume set to: $_volume');
+  }
+
+  @override
+  Future<void> dispose() async {
+    await stop();
+    await _amplitudeController.close();
   }
 }

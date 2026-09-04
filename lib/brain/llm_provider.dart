@@ -11,11 +11,38 @@ abstract class LLMProvider {
     String? systemPrompt,
   });
 
+  /// Stream a response from the LLM (if supported)
+  /// Returns null if streaming is not supported
+  Stream<LLMStreamChunk>? streamGenerate({
+    required String userMessage,
+    required List<ConversationTurn> context,
+    String? systemPrompt,
+  }) => null;
+
   /// Check if the provider is available
   Future<bool> isAvailable();
 
+  /// Check if streaming is supported
+  bool get supportsStreaming => false;
+
   /// Get provider name for diagnostics
   String get name;
+
+  /// Clean up resources
+  Future<void> dispose() async {}
+}
+
+/// A chunk from a streaming LLM response
+class LLMStreamChunk {
+  final String text;
+  final bool isComplete;
+  final ResponseType type;
+
+  const LLMStreamChunk({
+    required this.text,
+    this.isComplete = false,
+    this.type = ResponseType.conversation,
+  });
 }
 
 /// A single turn in the conversation

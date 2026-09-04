@@ -1,10 +1,91 @@
 import 'package:flutter/material.dart';
+import '../brain/reasoning_pipeline.dart';
 
 enum PrimeMode { standard, stealth, combat, diagnostic, sleep, offline }
 
 enum AgentStatus { online, offline, busy, error }
 
 enum TaskStatus { pending, running, completed, failed }
+
+/// Unified conversation state - single source of truth
+enum ConversationState {
+  /// No activity
+  idle,
+
+  /// Microphone active, waiting for speech
+  listening,
+
+  /// Speech detected, transcribing
+  transcribing,
+
+  /// Transcript received, LLM processing
+  thinking,
+
+  /// LLM streaming response
+  responding,
+
+  /// TTS playing audio
+  speaking,
+
+  /// Error occurred
+  error,
+
+  /// System offline
+  offline,
+}
+
+extension ConversationStateExtension on ConversationState {
+  String get label {
+    switch (this) {
+      case ConversationState.idle:
+        return 'READY';
+      case ConversationState.listening:
+        return 'LISTENING';
+      case ConversationState.transcribing:
+        return 'TRANSCRIBING';
+      case ConversationState.thinking:
+        return 'THINKING';
+      case ConversationState.responding:
+        return 'RESPONDING';
+      case ConversationState.speaking:
+        return 'SPEAKING';
+      case ConversationState.error:
+        return 'ERROR';
+      case ConversationState.offline:
+        return 'OFFLINE';
+    }
+  }
+
+  Color get color {
+    switch (this) {
+      case ConversationState.idle:
+        return const Color(0xFF33cc66);
+      case ConversationState.listening:
+        return const Color(0xFF00d4ff);
+      case ConversationState.transcribing:
+        return const Color(0xFF00d4ff);
+      case ConversationState.thinking:
+        return const Color(0xFF8855ff);
+      case ConversationState.responding:
+        return const Color(0xFF8855ff);
+      case ConversationState.speaking:
+        return const Color(0xFF00d4ff);
+      case ConversationState.error:
+        return const Color(0xFFff3366);
+      case ConversationState.offline:
+        return const Color(0xFF666666);
+    }
+  }
+
+  bool get isActive =>
+      this != ConversationState.idle &&
+      this != ConversationState.offline &&
+      this != ConversationState.error;
+
+  bool get canInterrupt =>
+      this == ConversationState.speaking ||
+      this == ConversationState.responding;
+}
 
 class Agent {
   final String id;
@@ -144,6 +225,7 @@ class ConversationMessage {
   final String content;
   final DateTime timestamp;
   final bool isStreaming;
+  final List<PipelineStep> steps;
 
   const ConversationMessage({
     required this.id,
@@ -151,6 +233,7 @@ class ConversationMessage {
     required this.content,
     required this.timestamp,
     this.isStreaming = false,
+    this.steps = const [],
   });
 
   ConversationMessage copyWith({
@@ -159,6 +242,7 @@ class ConversationMessage {
     String? content,
     DateTime? timestamp,
     bool? isStreaming,
+    List<PipelineStep>? steps,
   }) {
     return ConversationMessage(
       id: id ?? this.id,
@@ -166,6 +250,7 @@ class ConversationMessage {
       content: content ?? this.content,
       timestamp: timestamp ?? this.timestamp,
       isStreaming: isStreaming ?? this.isStreaming,
+      steps: steps ?? this.steps,
     );
   }
 

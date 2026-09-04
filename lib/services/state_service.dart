@@ -1,25 +1,30 @@
 import 'dart:async';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
-import 'package:path_provider/path_provider.dart';
 import '../models/prime_state.dart';
-import '../services/api_service.dart';
-import '../services/websocket_service.dart';
 import '../services/audio_service.dart';
 import '../services/voice_service.dart';
+import '../services/settings_service.dart';
+import '../services/debug_service.dart';
 import '../voice/voice_manager.dart';
-import '../brain/llm_provider.dart';
+import '../brain/conversation_manager.dart';
+import '../brain/reasoning_pipeline.dart';
+import '../providers/factories/provider_factory.dart';
+import '../engine/conversation_engine.dart';
 
 class StateService extends ChangeNotifier {
-  final ApiService _api = ApiService.instance;
-  final WebSocketService _ws = WebSocketService.instance;
   final AudioService _audio = AudioService.instance;
   final VoiceService _voice = VoiceService.instance;
   final VoiceManager _voiceManager = VoiceManager.instance;
 
+  // Core Intelligence (optional, enabled when configured)
+  ConversationEngine? _conversationEngine;
+  ProviderFactory? _providerFactory;
+  SettingsService? _settingsService;
+  DebugService? _debugService;
+  ConversationManager? _conversationContext;
+
   PrimeState _state = PrimeState(lastUpdate: DateTime.now());
-  Timer? _telemetryTimer;
-  Timer? _pollTimer;
   bool _initialized = false;
 
   // Voice state
@@ -28,8 +33,45 @@ class StateService extends ChangeNotifier {
   String _lastResponse = '';
   bool _voiceEnabled = true;
 
+  // LLM availability — separate from coreOnline
+  bool _llmAvailable = false;
+
+  // Reasoning pipeline steps — visible to UI during processing
+  List<PipelineStep> _pendingSteps = [];
+  StreamSubscription<PipelineStep>? _stepSubscription;
+
+  // Streaming text — progressive token delivery
+  StreamSubscription<String>? _chunkSubscription;
+  String? _streamingMessageId;
+  final StringBuffer _streamingBuffer = StringBuffer();
+
+  // Performance diagnostics
+  String _lastRequestId = '';
+  int _lastPromptChars = 0;
+  int _lastResponseChars = 0;
+  int _lastResponseWords = 0;
+  int _lastTotalMs = 0;
+
+  // Activity feed deduplication
+  String? _lastActivityMessage;
+
   PrimeState get state => _state;
   VoiceService get voice => _voice;
+
+  // Core Intelligence accessors
+  ConversationEngine? get conversationEngine => _conversationEngine;
+  DebugService? get debugService => _debugService;
+  SettingsService? get settingsService => _settingsService;
+  bool get coreIntelligenceAvailable => _conversationEngine != null;
+  bool get llmAvailable => _llmAvailable;
+  List<PipelineStep> get pendingSteps => _pendingSteps;
+
+  // Performance diagnostics getters
+  String get lastRequestId => _lastRequestId;
+  int get lastPromptChars => _lastPromptChars;
+  int get lastResponseChars => _lastResponseChars;
+  int get lastResponseWords => _lastResponseWords;
+  int get lastTotalMs => _lastTotalMs;
 
   List<Agent> get agents => _state.agents;
   Telemetry get telemetry => _state.telemetry;
@@ -69,33 +111,27 @@ class StateService extends ChangeNotifier {
       geminiApiKey: env['GEMINI_API_KEY'],
       geminiModel: env['GEMINI_MODEL'],
     );
-    _addActivity('brain', 'LLM: ${_voiceManager.llmEnabled ? _voiceManager.llmProvider?.name ?? "Enabled" : "Offline (local commands only)"}',
-        severity: _voiceManager.llmEnabled ? 'success' : 'warning');
 
-    _ws.events.listen(_handleWebSocketEvent);
-    _ws.connectionStatus.listen((connected) {
-      if (connected) {
-        _addActivity('system', 'Connection established', severity: 'success');
-        _ws.requestState();
-      } else {
-        _addActivity('system', 'Connection lost', severity: 'warning');
-      }
+    // Subscribe to reasoning pipeline steps for real-time UI updates + activity feed
+    _stepSubscription = _voiceManager.stepStream.listen((step) {
+      _updatePendingStep(step);
+      _logPipelineStep(step);
     });
 
-    await _ws.connect();
+    // Subscribe to streaming text chunks — progressive UI rendering
+    _chunkSubscription = _voiceManager.chunkStream.listen((chunk) {
+      _onStreamingChunk(chunk);
+    });
 
-    _telemetryTimer = Timer.periodic(
-      const Duration(seconds: 2),
-      (_) => _fetchTelemetry(),
-    );
+    // Track LLM availability separately from core status
+    _llmAvailable = _voiceManager.llmEnabled;
+    _addActivity('brain', 'LLM: ${_llmAvailable ? _voiceManager.llmProvider?.name ?? "Enabled" : "Offline (local commands only)"}',
+        severity: _llmAvailable ? 'success' : 'warning');
 
-    _pollTimer = Timer.periodic(
-      const Duration(seconds: 10),
-      (_) => _fetchState(),
-    );
-
-    _fetchState();
+    // Initialize default agents (all idle)
     _initializeDefaultAgents();
+
+    // Boot sequence — truthful, no fake delays
     _startBootSequence();
   }
 
@@ -108,24 +144,16 @@ class StateService extends ChangeNotifier {
     );
     notifyListeners();
 
-    await Future.delayed(const Duration(milliseconds: 500));
+    await Future.delayed(const Duration(milliseconds: 300));
     _addActivity('system', 'PRIME core initializing...', severity: 'info');
 
-    await Future.delayed(const Duration(seconds: 1));
-    _updateMode(PrimeMode.standard);
-    _addActivity('system', 'Core systems online', severity: 'success');
-
-    await Future.delayed(const Duration(milliseconds: 800));
-    _state = _state.copyWith(coreOnline: true, coreFrequency: 42.7, neuralActivity: 68.3);
-    notifyListeners();
-    _addActivity('system', 'All systems operational', severity: 'success');
-
-    // Start voice listening after boot
     await Future.delayed(const Duration(milliseconds: 500));
-    if (_voiceEnabled) {
-      _voice.startListening();
-      _addActivity('voice', 'Voice system activated', severity: 'success');
-    }
+
+    // Core is online — PRIME application is running
+    _updateMode(PrimeMode.standard);
+    _state = _state.copyWith(coreOnline: true);
+    notifyListeners();
+    _addActivity('system', 'Core systems online', severity: 'success');
   }
 
   void _initializeDefaultAgents() {
@@ -134,49 +162,48 @@ class StateService extends ChangeNotifier {
         id: 'alpha',
         name: 'ALPHA',
         role: 'Task Orchestrator',
-        status: AgentStatus.online,
-        load: 34.2,
+        status: AgentStatus.offline,
+        load: 0.0,
         lastActive: DateTime.now(),
       ),
       Agent(
         id: 'beta',
         name: 'BETA',
         role: 'Code Analysis',
-        status: AgentStatus.online,
-        load: 67.8,
+        status: AgentStatus.offline,
+        load: 0.0,
         lastActive: DateTime.now(),
       ),
       Agent(
         id: 'gamma',
         name: 'GAMMA',
         role: 'Memory & Context',
-        status: AgentStatus.online,
-        load: 45.1,
+        status: AgentStatus.offline,
+        load: 0.0,
         lastActive: DateTime.now(),
       ),
       Agent(
         id: 'delta',
         name: 'DELTA',
         role: 'Web Intelligence',
-        status: AgentStatus.busy,
-        load: 89.3,
+        status: AgentStatus.offline,
+        load: 0.0,
         lastActive: DateTime.now(),
-        currentTask: 'Fetching documentation',
       ),
       Agent(
         id: 'epsilon',
         name: 'EPSILON',
         role: 'File Operations',
-        status: AgentStatus.online,
-        load: 22.5,
+        status: AgentStatus.offline,
+        load: 0.0,
         lastActive: DateTime.now(),
       ),
       Agent(
         id: 'zeta',
         name: 'ZETA',
         role: 'Security Monitor',
-        status: AgentStatus.online,
-        load: 15.7,
+        status: AgentStatus.offline,
+        load: 0.0,
         lastActive: DateTime.now(),
       ),
       Agent(
@@ -185,19 +212,101 @@ class StateService extends ChangeNotifier {
         role: 'Performance Tuner',
         status: AgentStatus.offline,
         load: 0.0,
-        lastActive: DateTime.now().subtract(const Duration(minutes: 5)),
+        lastActive: DateTime.now(),
       ),
       Agent(
         id: 'theta',
         name: 'THETA',
         role: 'Data Synthesis',
-        status: AgentStatus.online,
-        load: 56.9,
+        status: AgentStatus.offline,
+        load: 0.0,
         lastActive: DateTime.now(),
       ),
     ];
     _state = _state.copyWith(agents: defaultAgents);
     notifyListeners();
+  }
+
+  /// Called for each streaming token from the LLM — updates the conversation in real-time
+  void _onStreamingChunk(String chunk) {
+    _streamingBuffer.write(chunk);
+
+    // Create the streaming message if it doesn't exist yet
+    if (_streamingMessageId == null) {
+      _streamingMessageId = 'streaming-${DateTime.now().millisecondsSinceEpoch}';
+      final placeholder = ConversationMessage(
+        id: _streamingMessageId!,
+        role: 'assistant',
+        content: '',
+        timestamp: DateTime.now(),
+        isStreaming: true,
+      );
+      _state = _state.copyWith(
+        conversation: [..._state.conversation, placeholder],
+      );
+      notifyListeners();
+    }
+
+    // Update the streaming message with accumulated text
+    final currentContent = _streamingBuffer.toString();
+    final conv = List<ConversationMessage>.from(_state.conversation);
+    final idx = conv.indexWhere((m) => m.id == _streamingMessageId);
+    if (idx >= 0) {
+      conv[idx] = conv[idx].copyWith(content: currentContent);
+      _state = _state.copyWith(conversation: conv);
+      notifyListeners();
+    }
+  }
+
+  /// Finalize the streaming message with complete content
+  void _finalizeStreamingMessage(String finalText, List<PipelineStep> steps) {
+    if (_streamingMessageId == null) return;
+
+    final conv = List<ConversationMessage>.from(_state.conversation);
+    final idx = conv.indexWhere((m) => m.id == _streamingMessageId);
+    if (idx >= 0) {
+      conv[idx] = ConversationMessage(
+        id: _streamingMessageId!,
+        role: 'assistant',
+        content: finalText,
+        timestamp: DateTime.now(),
+        steps: steps,
+        isStreaming: false,
+      );
+      _state = _state.copyWith(conversation: conv);
+    }
+    _streamingMessageId = null;
+    _streamingBuffer.clear();
+  }
+
+  void _updatePendingStep(PipelineStep step) {
+    // Replace or append the step in the pending list
+    final idx = _pendingSteps.indexWhere((s) => s.stage == step.stage);
+    if (idx >= 0) {
+      _pendingSteps = List.from(_pendingSteps);
+      _pendingSteps[idx] = step;
+    } else {
+      _pendingSteps = [..._pendingSteps, step];
+    }
+    notifyListeners();
+  }
+
+  void _logPipelineStep(PipelineStep step) {
+    switch (step.status) {
+      case StepStatus.active:
+        _addActivity('pipeline', '${step.stage.icon} ${step.stage.label}...', severity: 'info');
+        break;
+      case StepStatus.complete:
+        _addActivity('pipeline', '${step.stage.icon} ${step.stage.label} complete (${step.durationMs}ms)',
+            severity: 'success');
+        break;
+      case StepStatus.error:
+        _addActivity('error', '${step.stage.icon} ${step.stage.label} failed: ${step.text}',
+            severity: 'error');
+        break;
+      case StepStatus.pending:
+        break;
+    }
   }
 
   void handleVoiceCommand(String command) async {
@@ -233,206 +342,6 @@ class StateService extends ChangeNotifier {
     }
   }
 
-  void _handleWebSocketEvent(Map<String, dynamic> event) {
-    final type = event['type'] as String?;
-
-    switch (type) {
-      case 'state_update':
-        _handleStateUpdate(event);
-        break;
-      case 'telemetry_update':
-        _handleTelemetryUpdate(event);
-        break;
-      case 'agent_update':
-        _handleAgentUpdate(event);
-        break;
-      case 'chat_response':
-        _handleChatResponse(event);
-        break;
-      case 'activity':
-        _handleActivityEvent(event);
-        break;
-      case 'task_update':
-        _handleTaskUpdate(event);
-        break;
-      case 'error':
-        _handleErrorEvent(event);
-        break;
-      default:
-        debugPrint('[StateService] Unknown event type: $type');
-    }
-  }
-
-  void _handleStateUpdate(Map<String, dynamic> event) {
-    final data = event['data'] as Map<String, dynamic>?;
-    if (data == null) return;
-
-    final newMode = PrimeMode.values.firstWhere(
-      (e) => e.name == data['mode'],
-      orElse: () => _state.mode,
-    );
-    final wasOffline = _state.mode == PrimeMode.offline;
-
-    _state = _state.copyWith(
-      mode: newMode,
-      coreOnline: data['core_online'] ?? _state.coreOnline,
-      coreFrequency: (data['core_frequency'] as num?)?.toDouble() ?? _state.coreFrequency,
-      neuralActivity: (data['neural_activity'] as num?)?.toDouble() ?? _state.neuralActivity,
-    );
-    notifyListeners();
-
-    if (wasOffline && newMode != PrimeMode.offline) {
-      _audio.playStartup();
-    } else if (newMode == PrimeMode.sleep) {
-      _audio.playSleep();
-    }
-
-    _playSoundForState(newMode);
-  }
-
-  void _handleTelemetryUpdate(Map<String, dynamic> event) {
-    final data = event['data'] as Map<String, dynamic>?;
-    if (data == null) return;
-
-    _state = _state.copyWith(
-      telemetry: Telemetry.fromJson(data),
-    );
-    notifyListeners();
-  }
-
-  void _handleAgentUpdate(Map<String, dynamic> event) {
-    final data = event['data'] as Map<String, dynamic>?;
-    if (data == null) return;
-
-    final agentId = data['agent_id'] as String?;
-    if (agentId == null) return;
-
-    final index = _state.agents.indexWhere((a) => a.id == agentId);
-    if (index >= 0) {
-      final updated = _state.agents[index].copyWith(
-        status: AgentStatus.values.firstWhere(
-          (e) => e.name == data['status'],
-          orElse: () => _state.agents[index].status,
-        ),
-        load: (data['load'] as num?)?.toDouble() ?? _state.agents[index].load,
-        currentTask: data['current_task'] as String?,
-        clearTask: data['current_task'] == null,
-        lastActive: DateTime.now(),
-      );
-      final newAgents = List<Agent>.from(_state.agents);
-      newAgents[index] = updated;
-      _state = _state.copyWith(agents: newAgents);
-      notifyListeners();
-    }
-  }
-
-  void _handleChatResponse(Map<String, dynamic> event) {
-    final data = event['data'] as Map<String, dynamic>?;
-    if (data == null) return;
-
-    final message = ConversationMessage(
-      id: data['id'] as String? ?? DateTime.now().millisecondsSinceEpoch.toString(),
-      role: data['role'] as String? ?? 'assistant',
-      content: data['content'] as String? ?? '',
-      timestamp: DateTime.now(),
-    );
-
-    _state = _state.copyWith(
-      conversation: [..._state.conversation, message],
-    );
-    notifyListeners();
-
-    // Speak the AI response
-    if (message.role == 'assistant' && message.content.isNotEmpty) {
-      _voice.speak(message.content);
-    }
-  }
-
-  void _handleActivityEvent(Map<String, dynamic> event) {
-    final data = event['data'] as Map<String, dynamic>?;
-    if (data == null) return;
-
-    _addActivity(
-      data['type'] as String? ?? 'system',
-      data['message'] as String? ?? '',
-      severity: data['severity'] as String? ?? 'info',
-      agentId: data['agent_id'] as String?,
-    );
-  }
-
-  void _handleTaskUpdate(Map<String, dynamic> event) {
-    final data = event['data'] as Map<String, dynamic>?;
-    if (data == null) return;
-
-    final taskId = data['task_id'] as String?;
-    if (taskId == null) return;
-
-    final index = _state.tasks.indexWhere((t) => t.id == taskId);
-    if (index >= 0) {
-      final newTasks = List<Task>.from(_state.tasks);
-      newTasks[index] = newTasks[index].copyWith(
-        status: TaskStatus.values.firstWhere(
-          (e) => e.name == data['status'],
-          orElse: () => newTasks[index].status,
-        ),
-        result: data['result'] as String?,
-        completedAt: data['status'] == 'completed' || data['status'] == 'failed'
-            ? DateTime.now()
-            : null,
-      );
-      _state = _state.copyWith(tasks: newTasks);
-      notifyListeners();
-    }
-  }
-
-  void _handleErrorEvent(Map<String, dynamic> event) {
-    final message = event['message'] as String? ?? 'Unknown error';
-    _addActivity('error', message, severity: 'error');
-    _audio.playMalfunction();
-  }
-
-  void _playSoundForState(PrimeMode newMode) {
-    switch (newMode) {
-      case PrimeMode.standard:
-        break;
-      case PrimeMode.stealth:
-        _audio.playWake();
-        break;
-      case PrimeMode.combat:
-        _audio.playWarning();
-        break;
-      case PrimeMode.diagnostic:
-        _audio.playNotification();
-        break;
-      case PrimeMode.sleep:
-        _audio.playSleep();
-        break;
-      case PrimeMode.offline:
-        break;
-    }
-  }
-
-  Future<void> _fetchState() async {
-    final data = await _api.getState();
-    if (data != null) {
-      try {
-        final newState = PrimeState.fromJson(data);
-        _state = newState;
-        notifyListeners();
-      } catch (e) {
-        debugPrint('[StateService] State parse error: $e');
-      }
-    }
-  }
-
-  Future<void> _fetchTelemetry() async {
-    final data = await _api.getTelemetry();
-    if (data != null) {
-      _state = _state.copyWith(telemetry: Telemetry.fromJson(data));
-      notifyListeners();
-    }
-  }
-
   void updateMode(PrimeMode newMode) {
     final oldMode = _state.mode;
     _updateMode(newMode);
@@ -444,8 +353,6 @@ class StateService extends ChangeNotifier {
     } else if (newMode == PrimeMode.sleep) {
       _audio.playSleep();
     }
-
-    _ws.sendCommand('set_mode', payload: {'mode': newMode.name});
   }
 
   void _updateMode(PrimeMode newMode) {
@@ -492,11 +399,115 @@ class StateService extends ChangeNotifier {
     notifyListeners();
 
     _audio.playClick();
-    _ws.sendChatMessage(message);
+    _addActivity('user', 'Command: "${message.length > 60 ? '${message.substring(0, 60)}...' : message}"', severity: 'info');
+
+    // Reset state for new request
+    _pendingSteps = [];
+    _streamingBuffer.clear();
+    _streamingMessageId = null;
+    _voiceState = VoiceState.processing;
+    notifyListeners();
+
+    try {
+      // Route through VoiceManager — streaming LLM pipeline
+      final response = await _voiceManager.processInput(message);
+      _lastResponse = response.text;
+
+      // Store performance diagnostics
+      _lastRequestId = response.requestId ?? '';
+      _lastPromptChars = response.promptChars;
+      _lastResponseChars = response.responseChars;
+      _lastResponseWords = response.responseWords;
+      _lastTotalMs = response.totalDuration?.inMilliseconds ?? 0;
+
+      // Finalize the streaming message with complete content + steps
+      _finalizeStreamingMessage(response.text, response.steps);
+
+      _pendingSteps = [];
+      _voiceState = VoiceState.idle;
+      notifyListeners();
+
+      // Performance log
+      final ms = _lastTotalMs;
+      final wpm = ms > 0 ? ((response.responseWords * 60000) / ms).round() : 0;
+      _addActivity('brain',
+          '${response.requestId ?? "?"} — ${ms}ms, '
+          '${response.responseWords} words, ${response.responseChars} chars, '
+          '${wpm} wpm',
+          severity: 'success');
+
+      // TTS: NON-BLOCKING — fire and forget, never waits for audio
+      if (response.shouldSpeak && response.text.isNotEmpty) {
+        _voiceManager.speakAsync(response.text);
+      }
+    } catch (e) {
+      debugPrint('[StateService] sendChatMessage error: $e');
+      // Remove streaming placeholder if it exists
+      if (_streamingMessageId != null) {
+        final conv = List<ConversationMessage>.from(_state.conversation);
+        conv.removeWhere((m) => m.id == _streamingMessageId);
+        _state = _state.copyWith(conversation: conv);
+      }
+      _pendingSteps = [];
+      _streamingMessageId = null;
+      _streamingBuffer.clear();
+      _voiceState = VoiceState.idle;
+      notifyListeners();
+
+      final errorMsg = ConversationMessage(
+        id: (DateTime.now().millisecondsSinceEpoch + 2).toString(),
+        role: 'assistant',
+        content: 'I encountered an error processing your request. Please try again.',
+        timestamp: DateTime.now(),
+      );
+      _state = _state.copyWith(
+        conversation: [..._state.conversation, errorMsg],
+      );
+      notifyListeners();
+
+      _addActivity('error', 'Message processing failed: $e', severity: 'error');
+    }
+  }
+
+  /// Initialize Core Intelligence (Conversation Engine + Providers)
+  /// Call this after settings are available to enable real AI conversation
+  Future<void> initializeCoreIntelligence() async {
+    if (_conversationEngine != null) return;
+
+    try {
+      _debugService = DebugService.instance;
+      _settingsService = SettingsService();
+      await _settingsService!.initialize();
+
+      _providerFactory = ProviderFactory(_settingsService!, _debugService!);
+      _conversationContext = ConversationManager();
+
+      _conversationEngine = ConversationEngine(
+        providers: _providerFactory!,
+        settings: _settingsService!,
+        debug: _debugService!,
+        context: _conversationContext,
+      );
+
+      // Listen to engine state changes
+      _conversationEngine!.addListener(() {
+        notifyListeners();
+      });
+
+      _addActivity('engine', 'Core Intelligence initialized', severity: 'success');
+      debugPrint('[StateService] Core Intelligence initialized');
+    } catch (e) {
+      debugPrint('[StateService] Core Intelligence init failed: $e');
+      _addActivity('engine', 'Core Intelligence init failed: $e', severity: 'error');
+    }
   }
 
   void _addActivity(String type, String message,
       {String severity = 'info', String? agentId}) {
+    // Deduplicate: don't add same message consecutively
+    if (_lastActivityMessage == message) return;
+    _lastActivityMessage = message;
+
     final event = ActivityEvent(
       id: DateTime.now().millisecondsSinceEpoch.toString(),
       type: type,
@@ -507,55 +518,70 @@ class StateService extends ChangeNotifier {
     );
 
     final feed = [event, ..._state.activityFeed];
-    if (feed.length > 100) feed.removeRange(100, feed.length);
+    if (feed.length > 50) feed.removeRange(50, feed.length);
 
     _state = _state.copyWith(activityFeed: feed);
     notifyListeners();
   }
 
-  void updateTelemetry(Telemetry newTelemetry) {
-    _state = _state.copyWith(telemetry: newTelemetry);
-    notifyListeners();
-  }
+  /// Health check — reports status of each component
+  Map<String, bool> healthCheck() => {
+    'core': true, // PRIME app is running
+    'llm': _llmAvailable,
+    'memory': true, // ConversationManager always available
+    'network': false, // No backend connected
+  };
 
   Future<Map<String, String>> _loadEnv() async {
-    try {
-      // Look for .env in the same directory as the executable
-      final exePath = Platform.resolvedExecutable;
-      final exeDir = File(exePath).parent.path;
-      final envFile = File('$exeDir\\.env');
+    // Try multiple locations for .env
+    final locations = <String>[];
 
-      debugPrint('[StateService] Looking for .env at: $exeDir');
+    // 1. Next to the executable (production build)
+    final exePath = Platform.resolvedExecutable;
+    final exeDir = File(exePath).parent.path;
+    locations.add('$exeDir${Platform.pathSeparator}.env');
 
-      if (await envFile.exists()) {
-        final content = await envFile.readAsString();
-        final env = <String, String>{};
-        for (final line in content.split('\n')) {
-          final trimmed = line.trim();
-          if (trimmed.isEmpty || trimmed.startsWith('#')) continue;
-          final parts = trimmed.split('=');
-          if (parts.length >= 2) {
-            final key = parts[0].trim();
-            final value = parts.sublist(1).join('=').trim();
-            env[key] = value;
-            debugPrint('[StateService] Loaded: $key');
+    // 2. Project root (development — flutter run)
+    locations.add('/home/clawncore/prime/.env');
+
+    // 3. Current working directory
+    locations.add('${Directory.current.path}${Platform.pathSeparator}.env');
+
+    for (final path in locations) {
+      try {
+        final envFile = File(path);
+        if (await envFile.exists()) {
+          debugPrint('[StateService] Found .env at: $path');
+          final content = await envFile.readAsString();
+          final env = <String, String>{};
+          for (final line in content.split('\n')) {
+            final trimmed = line.trim();
+            if (trimmed.isEmpty || trimmed.startsWith('#')) continue;
+            final parts = trimmed.split('=');
+            if (parts.length >= 2) {
+              final key = parts[0].trim();
+              final value = parts.sublist(1).join('=').trim();
+              env[key] = value;
+              debugPrint('[StateService] Loaded: $key');
+            }
           }
+          if (env.isNotEmpty) return env;
         }
-        return env;
-      } else {
-        debugPrint('[StateService] .env not found at: $exeDir');
+      } catch (e) {
+        debugPrint('[StateService] .env load error at $path: $e');
       }
-    } catch (e) {
-      debugPrint('[StateService] .env load error: $e');
     }
+
+    debugPrint('[StateService] .env not found in any location');
     return {};
   }
 
   @override
   void dispose() {
-    _telemetryTimer?.cancel();
-    _pollTimer?.cancel();
+    _stepSubscription?.cancel();
+    _chunkSubscription?.cancel();
     _voice.dispose();
+    _conversationEngine?.dispose();
     super.dispose();
   }
 }
